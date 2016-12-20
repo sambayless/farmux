@@ -1,0 +1,127 @@
+#!/bin/bash
+#FARMUX: Launch a single command on a remote machine, inside a fresh tmux session. Optionally copy the command binary to the host (if a full path is specified).
+
+exec_command=${FARM_EXEC_COMMAND:-"ssh localhost"}
+copy_command=${FARM_COPY_COMMAND:-"$exec_command"}
+farm_local_tmp=${FARM_LOCAL_TMP:-"/tmp"}
+farm_host_tmp=${FARM_HOST_TMP:-"/tmp"} 
+verbose=0
+dry_run=0
+arg_pos=${FARM_DEFAULT_ARGUMENT:-"0"} #by default, do not copy any argument to the host. 
+prepend_command=${FARM_PREPEND_COMMAND:-""} 
+options=':qvtp:c:h'
+
+if [ "$1" -eq "$1" ] 2> /dev/null
+then
+	arg_pos=$1
+	shift
+fi
+
+while getopts $options option
+do
+    case $option in
+        q  )    verbose=0;;
+        v  )	verbose=1;;
+        c  )    exec_command=$OPTARG; copy_command=$OPTARG;;
+        t  )    dry_run=1;; # do dry run
+		p  )    arg_pos=$OPTARG;;
+    esac   
+done
+shift $(($OPTIND - 1))
+
+if [ "$1" -eq "$1" ] 2> /dev/null
+then
+	arg_pos=$1
+	shift
+fi
+
+#allow -1 to wrap around to last argument
+arg_pos=$((arg_pos%$#))
+if [ "$arg_pos" -lt "0" ]; then
+arg_pos=$(($#+$arg_pos))
+fi
+
+if [ "$verbose" -gt "0" ]; then
+	echo "FARM_EXEC_COMMAND: $exec_command"
+	echo "FARM_COPY_COMMAND: $copy_command"
+	echo "FARM_PREPEND_COMMAND: $prepend_command"
+	echo "FARM_LOCAL_TMP: $FARM_LOCAL_TMP"
+	echo "FARM_HOST_TMP: $FARM_HOST_TMP"
+	echo "Argument position to copy to remote server if executable: ${arg_pos} (0 disables copying)"
+fi	
+
+cleanup=""
+if [ "$arg_pos" -gt "0" ]; then
+	command=${@:arg_pos:1}
+	if [[ -x $command ]]; then
+	    #copy the file to a temporary file on the host
+	    #should probably use a remote call to mktemp...
+	    #one challenge is partly that for performance reasons 
+	    #we want to avoid making multiple ssh calls (required to call mktemp on the host).
+	    #A second challenge is that with the way that tar is being used below, we need the temp file to 
+	    #have the same name on the host and destination (this is likely solveable)
+	    command2="${command}.farm${$}" 
+		if [ "$verbose" -gt "0" ]; then
+			echo "Copying ${command} to ${host}:/tmp/${command2}"
+			echo "tar cpf - $command2 | $copy_command \"tar xpf - -C /tmp\""
+		fi	
+		if [ "$dry_run" -eq "0" ]; then
+			#could also use scp here, but by using tar+ssh, we get to let the user set just one environment variable (FARM_EXEC_COMMAND).
+			#ideally, I'd like to fold this argument into the main ssh below, but it is not obvious how to do that while preserving the interactive session.
+			
+			cp $command ${farm_local_tmp}/${command2}		
+			dr=${PWD}
+			cd ${farm_local_tmp} 
+			tar cpf - $command2 | $copy_command "tar xpf - -C ${farm_host_tmp}"
+			cd $dr
+
+			rm ${farm_local_tmp}/$command2
+			command2="${farm_host_tmp}/${command2}"
+			
+			cleanup="rm -f ${command2}"
+	    else
+		    echo "(Not actually copying because '-t' was set)"
+	    fi	    
+	    
+	    command=$command2
+	else
+		if [ "$verbose" -gt "0" ]; then
+			echo "(Not copying system command or non-binary file to server)"
+		fi	
+	fi
+	full_command="${prepend_command} ${@:1:arg_pos-1} $command ${@:$arg_pos+1}"
+else
+	command=""
+	full_command="${prepend_command} $@"
+fi
+
+if [ "$verbose" -gt "0" ]; then
+	echo "Executing command: '${full_command}'"
+fi
+
+if [ "$dry_run" -eq "0" ]; then
+	
+	farm_command=$(mktemp ${farm_local_tmp}/farmXXXXXXXXXX.sh)  #"/tmp/farm_cmd$$.sh"
+	function finish {
+		rm -f ${farm_command}
+	}
+	trap finish EXIT 
+	FARM_SESSION="FARM$$"
+	
+	#first cd to the user's home dir. Then attempt to cd to this system's current dir, if it exists on the server. 
+	#next, create a new tmux session, and launch the command in that session.
+	#finally, delete the executable, if we copied it to the host.
+	printf "cd ~\ncd $PWD\ntmux new -s $FARM_SESSION -d\ntmux send-keys -t $FARM_SESSION '${full_command}' ENTER\ntmux a -t $FARM_SESSION\n$cleanup\n" > $farm_command
+
+	if [ "$verbose" -gt "0" ]; then
+		echo "$exec_command \"$(cat $farm_command)\""
+	fi
+	
+	$exec_command "$(cat $farm_command)"
+
+else
+	echo "(Not executing command because '-t' was set)" 
+fi
+
+
+

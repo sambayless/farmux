@@ -1,15 +1,35 @@
 #!/bin/bash
 #FARMUX: Launch a single command on a remote machine, inside a fresh tmux session. Optionally copy the command binary to the host (if a full path is specified).
+if [ -r /etc/farmux/farmux.conf ]; then
+	source /etc/farmux/farmux.conf
+fi
 
-exec_command=${FARM_EXEC_COMMAND:-"ssh localhost"}
-copy_command=${FARM_COPY_COMMAND:-"$exec_command"}
-farm_local_tmp=${FARM_LOCAL_TMP:-"/tmp"}
-farm_host_tmp=${FARM_HOST_TMP:-"/tmp"} 
+if [ -r ~/.config/farmux/farmux.conf ]; then
+	echo "sourcing config file"
+  	source ~/.config/farmux/farmux.conf
+elif [ ! -e ~/.config/farmux/farmux.conf ] ; then
+	echo "creating default config file"	
+	mkdir -p ~/.config/farmux;
+	printf  "\n#This is the farmux default configuration file.\n#Uncomment lines below to alter their default values.\n\n#FARMUX_DEFAULT_ARGUMENT=0\n#FARMUX_DEFAULT_HOST=localhost\n#FARMUX_DEFAULT_USER=\"\"#Leave blank to use current user\n#FARMUX_PREPEND_COMMAND=\"\" #This string will be prepended to each command run on the remote machine.\n#FARMUX_SUFFIX_COMMAND=\"\" #This string be appended to each command run on the remote machine.\n#FARMUX_USE_SCP=1 #Set to 0 to copy files to the remote using tar+ssh, instead of scp.\n"  >  ~/.config/farmux/farmux.conf
+fi
+ssh_user=${FARMUX_DEFAULT_USER:-"$USER"}
+ssh_host=${FARMUX_DEFAULT_HOST:-"localhost"}
+ssh_args=${FARMUX_DEFAULT_SSH_ARGS:-""}
+scp_args=${FARMUX_DEFAULT_SCP_ARGS:-""}
+
+#exec_command=${FARMUX_EXEC_COMMAND:-"ssh "}
+#copy_command=${FARMUX_COPY_COMMAND:-"$exec_command"}
+local_tmp=${FARMUX_LOCAL_TMP:-"/tmp"}
+host_tmp=${FARMUX_HOST_TMP:-"/tmp"} 
 verbose=0
+quiet=0
 dry_run=0
-arg_pos=${FARM_DEFAULT_ARGUMENT:-"0"} #by default, do not copy any argument to the host. 
-prepend_command=${FARM_PREPEND_COMMAND:-""} 
+arg_pos=${FARMUX_DEFAULT_ARGUMENT:-"0"} #by default, do not copy any argument to the host. 
+prepend_command=${FARMUX_PREPEND_COMMAND:-""} 
+append_command=${FARMUX_APPEND_COMMAND:-""} 
+use_scp=${FARMUX_USE_SCP:-"1"} 
 options=':qvtp:c:h'
+safe_copy=${FARMUX_SAFE_COPY:-"0"} 
 
 if [ "$1" -eq "$1" ] 2> /dev/null
 then
@@ -20,7 +40,7 @@ fi
 while getopts $options option
 do
     case $option in
-        q  )    verbose=0;;
+        q  )    verbose=0; quiet=1;;
         v  )	verbose=1;;
         c  )    exec_command=$OPTARG; copy_command=$OPTARG;;
         t  )    dry_run=1;; # do dry run
@@ -35,6 +55,15 @@ then
 	shift
 fi
 
+if ( [ "$ssh_host" == "local_host" ] || [ "$ssh_host" == "127.0.0.1" ] ) && [ "$quiet" -eq "0" ]; then
+	echo "Warning: running on local host ($ssh_host)"
+fi
+
+exec_command="ssh $ssh_args  -t -t $ssh_user@$ssh_host" #'-t -t' forces an interactive terminal to be created
+copy_command="ssh $ssh_args $ssh_user@$ssh_host"
+
+full_scp_args="$scp_args $ssh_user@$ssh_host"
+full_scp_args=$(echo "${full_scp_args}" | xargs) #trim whitespace off the scp args -- this is improtant!
 #allow -1 to wrap around to last argument
 arg_pos=$((arg_pos%$#))
 if [ "$arg_pos" -lt "0" ]; then
@@ -42,11 +71,12 @@ arg_pos=$(($#+$arg_pos))
 fi
 
 if [ "$verbose" -gt "0" ]; then
-	echo "FARM_EXEC_COMMAND: $exec_command"
-	echo "FARM_COPY_COMMAND: $copy_command"
-	echo "FARM_PREPEND_COMMAND: $prepend_command"
-	echo "FARM_LOCAL_TMP: $FARM_LOCAL_TMP"
-	echo "FARM_HOST_TMP: $FARM_HOST_TMP"
+	echo "FARMUX_EXEC_COMMAND: $exec_command"
+	echo "FARMUX_COPY_COMMAND: $copy_command"
+	echo "FARMUX_SCP_COMMAND: scp $full_scp_args"
+	echo "FARMUX_PREPEND_COMMAND: $prepend_command"
+	echo "FARMUX_LOCAL_TMP: $local_tmp"
+	echo "FARMUX_HOST_TMP: $host_tmp"
 	echo "Argument position to copy to remote server if executable: ${arg_pos} (0 disables copying)"
 fi	
 
@@ -54,39 +84,64 @@ cleanup=""
 if [ "$arg_pos" -gt "0" ]; then
 	command=${@:arg_pos:1}
 	if [[ -x $command ]]; then
+
 	    #copy the file to a temporary file on the host
-	    #should probably use a remote call to mktemp...
-	    #one challenge is partly that for performance reasons 
-	    #we want to avoid making multiple ssh calls (required to call mktemp on the host).
-	    #A second challenge is that with the way that tar is being used below, we need the temp file to 
-	    #have the same name on the host and destination (this is likely solveable)
-	    command2="${command}.farm${$}" 
+	    cmd_name=$(basename $command)
+		if [ "$safe_copy" -gt "0" ]; then 
+	    	command2="$(${exec_command} mktemp ${host_tmp}/${cmd_name}.XXXXXXXX)" #create a temporary file on the remote server
+	    	command2=$(basename ${command2})
+	    else
+	    	#create a temporary file on local server, which we will _hope_ is also a valid temporary file on the remote server. 
+	    	#this is not safe, but it spares us a potentially slow ssh call
+		    command2="$(mktemp ${local_tmp}/${cmd_name}.XXXXXXXX)" #command2="${cmd_name}.${$}"
+		    rm $command2 #remove this local tmp file, since we don't actually need it
+		    command2=$(basename ${command2})
+	    fi
+	    
 		if [ "$verbose" -gt "0" ]; then
-			echo "Copying ${command} to ${host}:/tmp/${command2}"
-			echo "tar cpf - $command2 | $copy_command \"tar xpf - -C /tmp\""
+			echo "Copying ${command} to ${host}:${host_tmp}/${command2}"
 		fi	
-		if [ "$dry_run" -eq "0" ]; then
+		
+		if [ "$use_scp" -eq "0" ]; then 
+		    #should probably use a remote call to mktemp...
+		    #one challenge is partly that for performance reasons 
+		    #we want to avoid making multiple ssh calls (required to call mktemp on the host).
+		    #A second challenge is that with the way that tar is being used below, we need the temp file to 
+		    #have the same name on the host and destination (this is likely solveable)
 			#could also use scp here, but by using tar+ssh, we get to let the user set just one environment variable (FARM_EXEC_COMMAND).
 			#ideally, I'd like to fold this argument into the main ssh below, but it is not obvious how to do that while preserving the interactive session.
-			
-			cp $command ${farm_local_tmp}/${command2}		
-			dr=${PWD}
-			cd ${farm_local_tmp} 
-			tar cpf - $command2 | $copy_command "tar xpf - -C ${farm_host_tmp}"
-			cd $dr
-
-			rm ${farm_local_tmp}/$command2
-			command2="${farm_host_tmp}/${command2}"
-			
-			cleanup="rm -f ${command2}"
-	    else
-		    echo "(Not actually copying because '-t' was set)"
-	    fi	    
-	    
+			if [ "$verbose" -gt "0" ]; then
+				echo "tar cpf - $command2 | $copy_command \"tar xpf - -C ${host_tmp}\""
+			fi
+			if [ "$dry_run" -eq "0" ]; then									
+				cp $command ${local_tmp}/${command2}		
+				dr=${PWD}
+				cd ${local_tmp} 
+				tar cpf - $command2 | $copy_command "tar xpf - -C ${host_tmp}"
+				cd $dr	
+				rm ${local_tmp}/$command2
+		    else
+			    echo "(Not actually copying because '-t' was set)"
+		    fi
+		else
+			if [ "$verbose" -gt "0" ]; then
+				echo "scp $command $full_scp_args:${host_tmp}/${command2}"
+			fi
+								
+			#use scp to copy the file to the remote.
+			if [ "$dry_run" -eq "0" ]; then									
+				scp $command $full_scp_args:${host_tmp}/${command2}
+		    else
+			    echo "(Not actually copying because '-t' was set)"
+		    fi			
+		fi
+		command2="${host_tmp}/${command2}"			
+		cleanup="rm -f ${command2}"
+	    	    
 	    command=$command2
 	else
 		if [ "$verbose" -gt "0" ]; then
-			echo "(Not copying system command or non-binary file to server)"
+			echo "(Not copying system command or non-binary file '$command' to remote)"
 		fi	
 	fi
 	full_command="${prepend_command} ${@:1:arg_pos-1} $command ${@:$arg_pos+1}"
@@ -101,23 +156,23 @@ fi
 
 if [ "$dry_run" -eq "0" ]; then
 	
-	farm_command=$(mktemp ${farm_local_tmp}/farmXXXXXXXXXX.sh)  #"/tmp/farm_cmd$$.sh"
+	farmux_command=$(mktemp ${local_tmp}/farmux.XXXXXXXX.sh)  #"/tmp/farm_cmd$$.sh"
 	function finish {
-		rm -f ${farm_command}
+		rm -f ${farmux_command}
 	}
 	trap finish EXIT 
-	FARM_SESSION="FARM$$"
+	SESSION="F$$"
 	
 	#first cd to the user's home dir. Then attempt to cd to this system's current dir, if it exists on the server. 
 	#next, create a new tmux session, and launch the command in that session.
 	#finally, delete the executable, if we copied it to the host.
-	printf "cd ~\ncd $PWD\ntmux new -s $FARM_SESSION -d\ntmux send-keys -t $FARM_SESSION '${full_command}' ENTER\ntmux a -t $FARM_SESSION\n$cleanup\n" > $farm_command
+	printf "cd ~\ncd $PWD\ntmux new -s $SESSION -d\ntmux send-keys -t $SESSION '${full_command}' ENTER\ntmux a -t $SESSION\n$cleanup\n" > $farmux_command
 
 	if [ "$verbose" -gt "0" ]; then
-		echo "$exec_command \"$(cat $farm_command)\""
+		echo "$exec_command \"$(cat $farmux_command)\""
 	fi
 	
-	$exec_command "$(cat $farm_command)"
+	$exec_command "$(cat $farmux_command)"
 
 else
 	echo "(Not executing command because '-t' was set)" 

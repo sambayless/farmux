@@ -1,6 +1,5 @@
 # farmux
-Utility for launching jobs on remote machines, in fresh tmux sessions. 
-Automatically copies missing binaries to the remote machine, then opens a fresh tmux session before executing the command remotely.
+Utility for launching jobs on remote machines, in fresh tmux sessions. Optionally copies the command binary to the host (if a full path is specified).
 
 Usage: 
 ```

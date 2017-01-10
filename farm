@@ -12,13 +12,13 @@ elif [ ! -e ~/.config/farmux/farmux.conf ] ; then
 	mkdir -p ~/.config/farmux;
 	printf  "\n#This is the farmux default configuration file.\n#Uncomment lines below to alter their default values.\n\n#FARMUX_DEFAULT_ARGUMENT=0\n#FARMUX_DEFAULT_HOST=localhost\n#FARMUX_DEFAULT_USER=\"\"#Leave blank to use current user\n#FARMUX_PREPEND_COMMAND=\"\" #This string will be prepended to each command run on the remote machine.\n#FARMUX_SUFFIX_COMMAND=\"\" #This string be appended to each command run on the remote machine.\n#FARMUX_USE_SCP=1 #Set to 0 to copy files to the remote using tar+ssh, instead of scp.\n"  >  ~/.config/farmux/farmux.conf
 fi
+
 ssh_user=${FARMUX_DEFAULT_USER:-"$USER"}
 ssh_host=${FARMUX_DEFAULT_HOST:-"localhost"}
 ssh_args=${FARMUX_DEFAULT_SSH_ARGS:-""}
 scp_args=${FARMUX_DEFAULT_SCP_ARGS:-""}
 
-#exec_command=${FARMUX_EXEC_COMMAND:-"ssh "}
-#copy_command=${FARMUX_COPY_COMMAND:-"$exec_command"}
+
 local_tmp=${FARMUX_LOCAL_TMP:-"/tmp"}
 host_tmp=${FARMUX_HOST_TMP:-"/tmp"} 
 verbose=0
@@ -37,13 +37,32 @@ then
 	shift
 fi
 
+# Usage statement
+print_usage()
+{
+  cat <<EOF
+Usage: $0 [options] command [arguments for 'command'...]
+Where 'command' is a binary to be executed on the remote host, with arguments. 
+If 'command' is specified with a full path, then it will be copied to the host before executing it remotely (by default).
+  Options:
+    -v    Enable verbose logging.
+    -d    Do a dry run (nothing will be copied to or executed on the remote host).
+    -h    Print this help message and exit.
+    -p    Argument number to copy (defaults to p = 1, copying the command; use -t 0 to prevent copying.)
+EOF
+}
+
 while getopts $options option
 do
     case $option in
+        h|help )
+                print_usage
+                exit 0
+                ;;
         q  )    verbose=0; quiet=1;;
         v  )	verbose=1;;
         c  )    exec_command=$OPTARG; copy_command=$OPTARG;;
-        t  )    dry_run=1;; # do dry run
+        d  )    dry_run=1;; # do dry run
 		p  )    arg_pos=$OPTARG;;
     esac   
 done
@@ -161,7 +180,7 @@ if [ "$dry_run" -eq "0" ]; then
 		rm -f ${farmux_command}
 	}
 	trap finish EXIT 
-	SESSION="F$$"
+	SESSION="F$$" #what should the session be named? Should be short but unique....
 	
 	#first cd to the user's home dir. Then attempt to cd to this system's current dir, if it exists on the server. 
 	#next, create a new tmux session, and launch the command in that session.
